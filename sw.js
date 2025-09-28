@@ -1,5 +1,5 @@
 
-const CACHE = "qrpatrol-v1";
+const CACHE = "qrpatrol-v2";
 const ASSETS = [
   "./",
   "./index.html",
