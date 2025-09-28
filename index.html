@@ -1,0 +1,197 @@
+
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a6">
+  <title>QR 巡邏（自動停掃 2.0 / 含成功失敗提示）</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="icons/icon-192.png"/>
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <style>
+    html,body{height:100%}
+    body{font-family:system-ui,-apple-system,"PingFang TC","Noto Sans TC",Arial,sans-serif;margin:0;padding:16px;padding-top:calc(env(safe-area-inset-top,0) + 12px);background:#f9fafb}
+    h1{font-size:18px;margin:0 0 8px}
+    .card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:12px;margin:10px 0;box-shadow:0 1px 2px rgba(0,0,0,.03)}
+    label{display:block;font-size:14px;margin-bottom:6px}
+    input,button{font-size:16px;padding:12px;border-radius:10px;border:1px solid #cbd5e1;width:100%;box-sizing:border-box;background:#fff}
+    button.primary{background:#0ea5e9;color:#fff;border-color:#0284c7}
+    video{width:100%;background:#000;border-radius:12px}
+    .row{display:flex;gap:10px}.row>*{flex:1}
+    .small{font-size:12px;color:#64748b}.muted{color:#94a3b8}.ok{color:#059669}.err{color:#b91c1c}
+    ul{margin:6px 0 0 18px}
+    footer{margin-top:16px;text-align:center;color:#94a3b8;font-size:12px}
+    .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(env(safe-area-inset-bottom,0) + 18px);
+      padding:10px 14px;border-radius:999px;color:#fff;font-weight:600;box-shadow:0 8px 20px rgba(0,0,0,.18);display:none;z-index:9999;letter-spacing:.5px}
+    .toast.show{display:inline-block;animation:fade .15s ease-out}
+    .toast.info{background:#0284c7}.toast.success{background:#059669}.toast.error{background:#b91c1c}
+    @keyframes fade{from{opacity:0;transform:translate(-50%,8px)} to{opacity:1;transform:translate(-50%,0)}}
+  </style>
+</head>
+<body>
+  <h1>QR 巡邏</h1>
+
+  <div class="card">
+    <label>伺服器設定（貼 Apps Script <code>/exec</code>）</label>
+    <input id="endpoint" placeholder="例如：https://script.google.com/macros/s/XXXX/exec">
+    <div class="row" style="margin-top:10px">
+      <button id="save" class="primary">儲存</button>
+      <button id="ping">測試連線</button>
+      <button id="flush">上傳離線</button>
+    </div>
+    <div id="pingMsg" class="small muted"></div>
+  </div>
+
+  <div class="card">
+    <label>警衛 ID / 姓名</label>
+    <input id="guard" placeholder="例如：A001 或 王小明">
+  </div>
+
+  <div class="card">
+    <label>掃描 QR Code</label>
+    <video id="preview" playsinline></video>
+    <div class="row" style="margin-top:10px">
+      <button id="start" class="primary">開啟相機並開始掃描</button>
+      <button id="stop">停止</button>
+    </div>
+    <div id="status" class="small muted">尚未掃描</div>
+  </div>
+
+  <div class="card">
+    <label>沒有相機？手動輸入站點代碼</label>
+    <div class="row">
+      <input id="manual" placeholder="例如：S-01 或 Lobby-Left">
+      <button id="sendManual" class="primary">送出</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>離線佇列</label>
+    <ul id="queueList" class="small"></ul>
+  </div>
+
+  <footer>加入主畫面後可全螢幕使用（PWA）</footer>
+  <div id="toast" class="toast"></div>
+
+  <script>if('serviceWorker'in navigator){addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(()=>{}))}</script>
+  <script src="https://unpkg.com/@zxing/library@latest"></script>
+  <script>
+    const $=id=>document.getElementById(id);
+    const LS={ep:"qrpatrol.endpoint",gid:"qrpatrol.guard",q:"qrpatrol.queue"};
+    $("endpoint").value=localStorage.getItem(LS.ep)||"";
+    $("guard").value=localStorage.getItem(LS.gid)||"";
+    renderQueue();
+
+    $("save").onclick=()=>{localStorage.setItem(LS.ep,$("endpoint").value.trim());localStorage.setItem(LS.gid,$("guard").value.trim());toast("設定已儲存","success");msg("設定已儲存",true)};
+    $("ping").onclick=async()=>{const ep=$("endpoint").value.trim();if(!ep){toast("請先貼上 /exec 網址","error");return msg("請先貼上 /exec 網址",false)}try{const r=await fetch(ep+"?ping=1",{cache:"no-store"});$("pingMsg").textContent="回應："+await r.text();toast("連線正常","success")}catch(e){$("pingMsg").textContent="無法連線："+e.message;toast("無法連線","error")}};
+    $("sendManual").onclick=()=>handleScan(($("manual").value||"").trim());
+
+    // 狀態
+    let stream=null, reader=null, nativeTimer=null;
+    let scanningActive=false;         // <== 只要關掉，就不再處理任何回呼
+    let isSending=false, lastKey="", lastTime=0;
+    const COOLDOWN_MS=8000;
+
+    $("start").onclick=async()=>{
+      try{
+        scanningActive=true;
+        if('BarcodeDetector'in window){await startNative();}else{await startZXing();}
+        toast("開始掃描","info"); msg("掃描中…（掃到即自動停止）",true);
+      }catch(e){scanningActive=false;toast("相機開啟失敗","error");msg("相機開啟失敗："+e.message,false)}
+    };
+    $("stop").onclick=()=>{scanningActive=false;stopAll();toast("已停止掃描","info")};
+
+    async function startNative(){
+      const detector=new BarcodeDetector({formats:["qr_code"]});
+      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}});
+      $("preview").srcObject=stream; await $("preview").play();
+      nativeTimer=setInterval(async()=>{
+        if(!scanningActive) return;
+        try{
+          const bitmap=await createImageBitmap($("preview"));
+          const ds=await detector.detect(bitmap);
+          if(!scanningActive) return;
+          if(ds && ds.length){
+            const text=ds[0].rawValue||"";
+            if(text) await handleScan(text);
+          }
+        }catch(_){}
+      },400);
+    }
+    async function startZXing(){
+      reader=new ZXing.BrowserMultiFormatReader();
+      let deviceId=null;
+      try{const devs=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==="videoinput");if(devs[0])deviceId=devs[0].deviceId}catch(_){}
+      const constraints=deviceId?{video:{deviceId}}:{video:{facingMode:"environment"}};
+      stream=await navigator.mediaDevices.getUserMedia(constraints);
+      $("preview").srcObject=stream; await $("preview").play();
+      reader.decodeFromVideoDevice(null,$("preview"),async(res,err)=>{
+        if(!scanningActive) return;
+        if(res){ await handleScan(res.getText()); }
+      });
+    }
+    function stopAll(){
+      if(nativeTimer){clearInterval(nativeTimer);nativeTimer=null}
+      if(reader){try{reader.reset()}catch{} reader=null}
+      if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}
+      msg("已停止",true);
+    }
+
+    async function handleScan(raw){
+      if(!scanningActive) return;           // 忽略多餘回呼
+      scanningActive=false;                 // <== 立刻關閉掃描（先設旗標）
+      stopAll();                            // <== 先停掉相機，避免重複觸發
+
+      if(!raw){toast("讀取失敗","error");return msg("讀取失敗",false)}
+      const ep=$("endpoint").value.trim(), gid=$("guard").value.trim();
+      if(!ep||!gid){toast("請先設定 /exec 與 警衛ID","error");return msg("請先設定 /exec 與 警衛ID",false)}
+
+      let station=raw;
+      try{const u=new URL(raw);const s=u.searchParams.get("station")||u.searchParams.get("id");if(s)station=s}catch(_){}
+      station=String(station).trim().toUpperCase();
+
+      const key=gid+"|"+station, nowMs=Date.now();
+      if(isSending || (key===lastKey && (nowMs-lastTime)<COOLDOWN_MS)){ return; }
+      isSending=true; lastKey=key; lastTime=nowMs;
+
+      let loc=null;
+      try{
+        await new Promise(res=>{
+          if(!navigator.geolocation) return res();
+          navigator.geolocation.getCurrentPosition(
+            p=>{loc={lat:p.coords.latitude,lng:p.coords.longitude,acc:p.coords.accuracy};res();},
+            _=>res(),
+            {enableHighAccuracy:true,timeout:7000,maximumAge:30000}
+          );
+        });
+      }catch(_){}
+
+      const payload={station,guardId:gid,scannedAtClient:new Date().toISOString(),location:loc,userAgent:navigator.userAgent};
+
+      try{
+        await fetch(ep,{method:"POST",mode:"no-cors",headers:{"Content-Type":"text/plain;charset=utf-8"},body:JSON.stringify(payload)});
+        toast(`讀取成功：${station}`,"success"); msg("✅ 已送出：「"+station+"」",true);
+      }catch(e){
+        const arr=JSON.parse(localStorage.getItem(LS.q)||"[]");arr.push(payload);
+        localStorage.setItem(LS.q", JSON.stringify(arr)); renderQueue();
+        toast("連線失敗，已暫存離線","error"); msg("連線失敗，已暫存離線",false);
+      }finally{ setTimeout(()=>{isSending=false},1200); }
+    }
+
+    $("flush").onclick=async()=>{
+      const ep=$("endpoint").value.trim();
+      const arr=JSON.parse(localStorage.getItem(LS.q)||"[]");
+      if(!ep){toast("請先設定 /exec","error");return msg("請先設定 /exec",false)}
+      if(!arr.length){toast("沒有待上傳資料","info");return msg("沒有待上傳資料",true)}
+      for(const it of arr){ try{ await fetch(ep,{method:"POST",mode:"no-cors",headers:{"Content-Type":"text/plain;charset=utf-8"},body:JSON.stringify(it)}); }catch(_){ } }
+      localStorage.removeItem(LS.q); renderQueue(); toast("離線資料已全部上傳","success"); msg("離線資料已全部上傳",true);
+    };
+
+    function renderQueue(){const arr=JSON.parse(localStorage.getItem(LS.q)||"[]");$("queueList").innerHTML=arr.length?arr.map((it,i)=>`<li>${i+1}. ${it.station} @ ${it.scannedAtClient}</li>`).join(""):'<li class="muted">（空）</li>'}
+    function msg(t,good){const el=$("status");el.textContent=t;el.className="small "+(good?"ok":"err");setTimeout(()=>{el.className="small muted"},3500)}
+    function toast(text,type){const el=$("toast");el.textContent=text;el.className="toast show "+(type||"info");setTimeout(()=>{el.classList.remove("show")},1800);try{if(navigator.vibrate){if(type==="success")navigator.vibrate(80);else if(type==="error")navigator.vibrate([80,50,80]);else navigator.vibrate(40);}}catch(_){}};
+  </script>
+</body>
+</html>
